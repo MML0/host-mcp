@@ -18,7 +18,7 @@ If you have been asked to install or use this server, read this section first.
 
 **What you can do:** manage files under one folder, the *managed root*. All paths are relative to it, such as `blog/index.php`. Use `.` for the root itself.
 
-**What you cannot do:** run shell commands or SQL, move or rename files, delete folders, read binary files, or touch the server's own `mcp/` folder.
+**What you cannot do:** run shell commands or SQL, move or rename files, delete folders, read binary or non-UTF-8 files, use symlinks, or touch the server's own `mcp/` folder.
 
 ### Installing it for a user
 
@@ -30,10 +30,10 @@ If you have been asked to install or use this server, read this section first.
 
 ### Working rules
 
-1. **Start with `get_server_info`, then `list_files`** on the narrowest folder you can. `list_files` is recursive, so listing `.` on a large site returns a lot.
+1. **Start with `get_server_info`**, which shows the limits and whether zip is available. Then use `search_files`, or `list_files` on the narrowest folder you can. If `has_more` is true, call again with `next_offset`.
 2. **Read before you overwrite.** `write_file` replaces the whole file, with no backup and no undo. Keep existing line endings: a file with CRLF should stay CRLF.
 3. **Confirm with the user before deleting.** `delete_file` is permanent, and so is overwriting through `extract_zip`.
-4. **Check results.** A failed tool call returns HTTP 200 with `isError: true`, so look at `isError` and not only the status code.
+4. **Check results.** A failed tool call returns HTTP 200 with `isError: true`, so look at `isError` and not only the status code. Act on `error.code` and `error.hint`.
 5. **Verify after you write.** Read the file back, or request the page.
 6. **Treat `.php` files as live code.** Anything you write there can run as soon as someone requests it, and a syntax error can take the site down. Check syntax locally first.
 7. **Clean up.** If you upload a temporary diagnostic script, protect it and delete it when you finish.
@@ -48,6 +48,8 @@ If you have been asked to install or use this server, read this section first.
 | Upload images, fonts or other binary files | `extract_zip` |
 | Upload many files, or create nested folders | `extract_zip` |
 | Upload a file over 1 MB | `extract_zip` (8 MB zipped) |
+| Find a file by name or extension | `search_files` |
+| Check a file's type, size or date, including binary files | `get_file_info` |
 | Create one folder | `create_directory` (the parent must exist) |
 | Remove a folder | Delete its files, then ask the user to remove the folder |
 | Rename or move | Write the new file, verify it, then delete the old one |
@@ -110,14 +112,18 @@ claude mcp add --transport http my-host https://YOUR-DOMAIN/mcp/ --header "Autho
 
 | Tool | Arguments | Result | Limits and behaviour |
 |---|---|---|---|
-| `get_server_info` | none | `php_version`, `managed_root`, `free_disk_bytes`, `max_upload_bytes`, `max_execution_time` | Shows the server's absolute root path |
-| `list_files` | `path` (default `.`) | `items`: `path`, `type`, `size`, `permissions` | Recursive to 8 levels below the path; skips symlinks and `mcp/` |
-| `read_file` | `path` | `path`, `content` | Text only, up to 1 MB; rejects files containing null bytes |
-| `write_file` | `path`, `content` | `path`, `bytes_written` | Creates or overwrites, up to 1 MB; the parent folder must exist |
+| `get_server_info` | none | Root, PHP and server versions, `extensions`, `zip_available`, disk space, `memory_limit`, `post_max_size`, `max_upload_bytes`, `max_execution_time`, `tool_limits` | Shows the server's absolute root path |
+| `list_files` | `path` (default `.`), `recursive` (default `true`), `offset` (default `0`), `limit` (default `1000`, max `5000`) | `items`: `path`, `type`, `size`, `permissions`; `offset`, `has_more`, `next_offset` | Up to 8 levels below the path; skips symlinks and `mcp/` |
+| `search_files` | `name` and/or `extension`, `path` (default `.`), `limit` (default `200`, max `5000`) | `items`, `truncated` | Matches file names, case-insensitive; does not search inside files |
+| `get_file_info` | `path` | `path`, `type`, `size`, `permissions`, `mime`, `modified`, `readable`, `writable` | `mime` is `null` without the `fileinfo` extension |
+| `read_file` | `path` | `path`, `content` | Valid UTF-8 text only, up to 1 MB |
+| `write_file` | `path`, `content` | `path`, `bytes_written`, `atomic` | Creates or overwrites, up to 1 MB; the parent folder must exist; keeps an existing file's permissions |
 | `create_directory` | `path` | `path`, `created` | One level at a time; fails if the path exists |
 | `delete_file` | `path` | `path`, `deleted` | Regular files only; permanent |
 | `set_permissions` | `path`, `mode` | `path`, `mode`, `changed` | `600`, `640`, `644`, `700`, `750` or `755` only |
 | `extract_zip` | `zip_base64`, `path` (default `.`) | `destination`, `files`, `directories`, `bytes_written`, `skipped` | See below |
+
+**Atomic writes:** `write_file` and `extract_zip` write to a temporary file in the same folder, then rename it, so a failed write leaves the original intact. If the PHP user can edit a file but cannot create files in its folder, `write_file` writes in place and returns `atomic: false`. A crash in that case can leave a partial file.
 
 **`extract_zip` details:**
 
@@ -125,7 +131,9 @@ claude mcp add --transport http my-host https://YOUR-DOMAIN/mcp/ --header "Autho
 - Existing files are **overwritten**.
 - Limits are 8 MB zipped, 100 MB unpacked and 5000 entries.
 - `__MACOSX/` and `.DS_Store` are skipped.
-- Every entry name is checked before anything is written, so an unsafe name rejects the whole zip. A failure during writing, such as a full disk, can leave some files written.
+- The whole zip is checked before anything is written. It is rejected for unsafe names, duplicate files, a path used as both file and folder, a target that goes through a symlink, or a clash with an existing file or folder.
+- The real unpacked size is counted during extraction, so a zip that understates its size stops at the limit.
+- A failure during writing, such as a full disk, can leave earlier files written. The error says how many, and each file is either complete or unchanged.
 
 ## HTTP protocol
 
@@ -153,11 +161,24 @@ A successful call puts the data in `result.structuredContent`, with the same dat
 {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"path\":\"a.txt\",\"deleted\":true}"}],"structuredContent":{"path":"a.txt","deleted":true},"isError":false}}
 ```
 
-A failed tool call returns HTTP 200 with the reason as text:
+A failed tool call returns HTTP 200 with a stable code and a suggested next step:
 
 ```json
-{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Path does not exist."}],"isError":true}}
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Path does not exist: a.txt Call list_files or search_files to find the right path."}],"structuredContent":{"error":{"code":"not_found","message":"Path does not exist: a.txt","hint":"Call list_files or search_files to find the right path."}},"isError":true}}
 ```
+
+| Error code | Meaning |
+|---|---|
+| `invalid_path`, `outside_root` | The path is absolute, uses `..`, or is outside the root |
+| `not_found`, `parent_missing` | The path or its parent folder does not exist |
+| `not_a_file`, `not_a_directory`, `path_conflict` | The path is the wrong type, or already exists |
+| `symlink_rejected`, `protected_path` | The path goes through a symlink, or into `mcp/` |
+| `not_utf8` | The file is binary or not valid UTF-8 |
+| `too_large` | A size or entry limit was exceeded |
+| `unsafe_zip` | The zip has an unsafe name, a duplicate, or a file and folder conflict |
+| `zip_unavailable` | The PHP zip extension is not enabled |
+| `read_failed`, `write_failed` | The operation failed, usually because of ownership or disk space |
+| `invalid_argument`, `unknown_tool` | The request itself is wrong |
 
 | HTTP status | Meaning |
 |---|---|
@@ -179,8 +200,9 @@ Built-in protections:
 - Bearer token, compared in constant time
 - Requests refused until the placeholder token is replaced
 - `..`, absolute paths and paths that resolve outside the root rejected
+- Any path that goes through a symlink rejected, so an operation cannot reach a link's target
 - The `mcp/` folder hidden and protected, including from zip extraction
-- Zip entry names checked before extraction
+- Whole zip checked before extraction, with real size limits enforced during it
 - `Origin` checked when the header is present
 
 What you should do:
@@ -205,8 +227,28 @@ There is no audit log or rate limiting. Your web server's access log records req
 | Large zip fails, or returns `Invalid Request` | The host's `post_max_size` is too small. Base64 makes the upload about a third larger, so an 8 MB zip needs about 11 MB. Send smaller zips. |
 | `Write failed` | The PHP user does not own the file or folder. Fix ownership in the host panel. |
 | `Parent directory does not exist` | Call `create_directory` for each level first, or use `extract_zip` |
-| `Unable to read as a text file` | The file is binary. The server cannot read it back. |
+| `not_utf8` on a text file | The file uses another encoding, such as Windows-1256. Convert it to UTF-8 elsewhere, because the server cannot read it. |
+| `symlink_rejected` | Use the real path. Run `get_server_info` to see the root, which may itself be a resolved link. |
+| `atomic: false` in a write result | The PHP user cannot create files in that folder. Fix folder ownership. |
 | Need to change the server itself | Use the host's file manager or FTP, because `mcp/` is protected from its own tools |
+
+## Upgrading from 1.0
+
+Replace `mcp/index.php` and set your token again. The 8 existing tools keep their names. Three things can affect existing callers:
+
+- `list_files` returns at most 1000 items per call, so check `has_more`.
+- `read_file` now refuses text that is not valid UTF-8.
+- Paths through symlinks are now refused, including for reads.
+
+## Development
+
+The tests start the real server in a temporary folder. They need PHP 8.1 or newer with `zip`.
+
+```bash
+php tests/run.php
+```
+
+GitHub Actions runs them on PHP 8.1, 8.2 and 8.4.
 
 ## References
 
