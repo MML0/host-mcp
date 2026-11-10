@@ -2,20 +2,20 @@
 declare(strict_types=1);
 
 /*
- * host-mcp 2.0.0: a one-file MCP server that lets an AI agent manage a website's files.
+ * host-mcp 2.0.1: a one-file MCP server that lets an AI agent manage a website's files.
  *
- * Upload this file to public_html/mcp/index.php, then put your settings in ~/.host-mcp.ini,
- * outside the website (see host-mcp.example.ini). If you cannot create files outside
- * public_html, use mcp/config.php (it returns an array), or as a last resort set MCP_TOKEN here.
+ * 1. Type your secret token below. Any password works; longer is safer.
+ * 2. Upload this file to public_html/mcp/index.php.
+ * Optional: put settings in ~/.host-mcp.ini instead (see README). A token there wins over this one.
  */
 
-const MCP_TOKEN = 'REPLACE_WITH_A_LONG_RANDOM_SECRET';
+const MCP_TOKEN = '';
 const MCP_CONFIG_FILE = ''; /* Optional absolute path to the config file. */
 
 const MCP_PROTOCOL_VERSION = '2025-03-26';
 const MCP_SERVER_NAME = 'host-mcp';
-const MCP_SERVER_VERSION = '2.0.0';
-const MCP_PLACEHOLDER = 'REPLACE_WITH_A_LONG_RANDOM_SECRET';
+const MCP_SERVER_VERSION = '2.0.1';
+const MCP_PLACEHOLDER = 'REPLACE_WITH_A_LONG_RANDOM_SECRET'; /* the 1.x placeholder, never accepted */
 const MCP_JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
 const MCP_MB = 1048576;
 const MCP_MAX_TEXT = MCP_MB;              /* read_file, write_file, patch_file, search_content */
@@ -27,7 +27,7 @@ const MCP_MAX_REQUEST = 12 * MCP_MB;      /* room for an 8 MB zip after base64 a
 const MCP_MAX_DEPTH = 8;
 const MCP_MAX_TREE = 10000;               /* entries in one delete_directory */
 const MCP_MAX_SCAN = 20000;               /* files read by one search_content */
-const MCP_MIN_TOKEN = 24;
+const MCP_WEAK_TOKEN = 12;                /* shorter tokens work, with a warning */
 const MCP_PHP_EXTS = ['php', 'phtml', 'php5', 'php7', 'php8'];
 const MCP_SKIP_DIRS = ['.git', 'node_modules'];
 const MCP_WRITE_TOOLS = ['write_file', 'patch_file', 'create_directory', 'move_file', 'delete_file',
@@ -107,14 +107,15 @@ function loadConfig(): array {
     if ($explicit !== '' && $file === null) fatal('Config file not found: ' . basename($explicit));
     $get = fn(string $key, $default) => array_key_exists($key, $values) ? $values[$key] : $default;
 
-    $token = (string)$get('token', MCP_TOKEN === MCP_PLACEHOLDER ? '' : MCP_TOKEN);
-    $tokenSource = array_key_exists('token', $values) ? 'config' : (MCP_TOKEN === MCP_PLACEHOLDER ? 'none' : 'index.php');
-    $tokens = [];
-    if (strlen($token) >= MCP_MIN_TOKEN && $token !== MCP_PLACEHOLDER) $tokens[] = $token;
+    $usable = fn(string $t) => $t !== '' && $t !== MCP_PLACEHOLDER;
+    $fromConfig = array_key_exists('token', $values) && $usable((string)$values['token']);
+    $token = $fromConfig ? (string)$values['token'] : ($usable(MCP_TOKEN) ? MCP_TOKEN : '');
+    $tokenSource = $fromConfig ? 'config' : ($token !== '' ? 'index.php' : 'none');
+    $tokens = $token !== '' ? [$token] : [];
     /* Rotation: the old token keeps working until the date you set, so clients can switch over. */
     $previous = (string)$get('previous_token', '');
     $previousUntil = (string)$get('previous_token_expires', '');
-    $previousActive = strlen($previous) >= MCP_MIN_TOKEN && preg_match('/^\d{4}-\d{2}-\d{2}$/', $previousUntil) === 1
+    $previousActive = $usable($previous) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $previousUntil) === 1
         && gmdate('Y-m-d') <= $previousUntil;
     if ($previousActive) $tokens[] = $previous;
 
@@ -142,7 +143,7 @@ function loadConfig(): array {
     return [
         'self' => $self, 'site' => $site, 'root' => $root, 'config_file' => $file,
         'tokens' => $tokens, 'token_source' => $tokenSource,
-        'token_too_short' => $token !== '' && strlen($token) < MCP_MIN_TOKEN,
+        'token_weak' => $token !== '' && strlen($token) < MCP_WEAK_TOKEN,
         'previous_token_until' => $previousActive ? $previousUntil : null,
         'data_dir' => $dataDir,
         'read_only' => (bool)$get('read_only', false),
@@ -883,7 +884,8 @@ function bearerToken(): ?string {
             if (strcasecmp((string)$name, 'Authorization') === 0) $auth = (string)$value;
         }
     }
-    return preg_match('/^Bearer\s+(\S+)\s*$/i', $auth, $match) ? $match[1] : null;
+    /* Any password works, including one with spaces. */
+    return preg_match('/^Bearer\s+(.+?)\s*$/is', $auth, $match) ? $match[1] : null;
 }
 
 function authenticate(?string $token): void {
@@ -910,9 +912,9 @@ function warnings(): array {
     $cfg = Mcp::$cfg;
     $list = [];
     if ($cfg['tokens'] === []) {
-        $list[] = $cfg['token_too_short'] ? 'The token is shorter than ' . MCP_MIN_TOKEN . ' characters, so it is ignored.' : 'No token is set, so every request is refused.';
+        $list[] = 'No token is set, so every request is refused. Type one into MCP_TOKEN at the top of index.php.';
     }
-    if ($cfg['token_source'] === 'index.php') $list[] = 'The token is stored in index.php. Move it to ~/.host-mcp.ini, outside the website.';
+    if ($cfg['token_weak']) $list[] = 'The token is shorter than ' . MCP_WEAK_TOKEN . ' characters. It works, but a longer one is much harder to guess.';
     if ($cfg['previous_token_until'] !== null) $list[] = 'The previous token still works until ' . $cfg['previous_token_until'] . '.';
     if (!isHttps() && !isLocalRequest()) $list[] = 'This request did not use HTTPS, so the token can be read in transit.';
     if ($cfg['data_dir'] === null) {

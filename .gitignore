@@ -1,6 +1,0 @@
-.DS_Store
-.env
-*.zip
-mcp/data/
-mcp/config.php
-.host-mcp.ini
